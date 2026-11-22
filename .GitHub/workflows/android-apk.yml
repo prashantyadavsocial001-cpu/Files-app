@@ -1,1 +1,131 @@
+name: Android Offline APK Build & Verification
 
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_SDK_ROOT: ${{ github.workspace }}/../android-sdk
+  CMDLINE_TOOLS_URL: https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+
+jobs:
+  build-and-verify:
+    name: Test & Build FolioFlow APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # Uses our OWN writable SDK folder, so no chmod/sudo on the runner's
+      # read-only /usr/local/lib/android/sdk is ever needed.
+      - name: Configure Android SDK & Install API 36.1
+        shell: bash
+        run: |
+          set -eu
+          SDK_ROOT="$(realpath -m "$ANDROID_SDK_ROOT")"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          curl -fsSL "$CMDLINE_TOOLS_URL" -o /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-unpack
+          rm -rf "$SDK_ROOT/cmdline-tools/latest"
+          mv /tmp/cmdline-unpack/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+          rm -rf /tmp/cmdline-tools.zip /tmp/cmdline-unpack
+
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "sdk.dir=$SDK_ROOT" > local.properties
+
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null 2>&1 || true
+          set -o pipefail
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "platforms;android-36.1" \
+            "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Prepare debug keystore (with fallback)
+        shell: bash
+        run: |
+          if [ -f "debug.keystore.base64" ] && [ ! -f "debug.keystore" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          elif [ ! -f "debug.keystore" ]; then
+            keytool -genkeypair -keystore debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Verify zero INTERNET permission in AndroidManifest
+        shell: bash
+        run: |
+          if grep -q "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
+            echo "ERROR: Offline privacy policy violated — INTERNET permission detected!"
+            exit 1
+          fi
+
+      - name: Run Unit & Robolectric Tests
+        run: gradle :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Build Debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Build Release APK (with CI or secret keystore)
+        shell: bash
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/ci-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD || 'folioflow_ci_pass' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'folioflow_ci_pass' }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          else
+            keytool -genkeypair -keystore "$KEYSTORE_PATH" \
+              -storepass "$STORE_PASSWORD" -alias upload -keypass "$KEY_PASSWORD" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=FolioFlow CI,O=FolioFlow,C=US"
+          fi
+          gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify APK outputs exist
+        shell: bash
+        run: |
+          ls -lh app/build/outputs/apk/debug/*.apk
+          ls -lh app/build/outputs/apk/release/*.apk
+
+      - name: Upload Debug & Release APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: FolioFlow-APKs
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          
