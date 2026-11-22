@@ -1,0 +1,6 @@
+{
+  "name": "FolioFlow",
+  "description": "100% offline native document reader, editor, format converter, file manager, and universal media player.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
